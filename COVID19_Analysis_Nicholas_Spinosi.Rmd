@@ -1,0 +1,181 @@
+---
+title: "COVID19 Data Analysis"
+author: "Nick Spinosi"
+date: "2025-06-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(lubridate)
+```
+##Loading Data
+
+```{r download_data}
+url_in <- "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/"
+
+file_names <- c("time_series_covid19_confirmed_global.csv",
+                "time_series_covid19_deaths_global.csv",
+                "time_series_covid19_confirmed_US.csv",
+                "time_series_covid19_deaths_US.csv")
+
+urls <- str_c(url_in,file_names)
+```
+
+## Importing Data
+```{r import_data, message=FALSE}
+global_cases <- read_csv(urls[1])
+global_deaths <- read_csv(urls[2])
+US_cases <- read_csv(urls[3])
+US_deaths <- read_csv(urls[4])
+```
+
+## Data Selection and Cleaning 
+
+```{r clean_data}
+global_cases <- global_cases %>%
+  pivot_longer(
+    cols = -c(`Province/State`, `Country/Region`, Lat, Long),
+    names_to = "date",
+    values_to = "cases"
+  ) %>%
+  select(-c(Lat, Long))
+
+
+global_deaths <- global_deaths %>%
+  pivot_longer(
+    cols = -c(`Province/State`, `Country/Region`, Lat, Long),
+    names_to = "date",
+    values_to = "deaths"
+  ) %>%
+  select(-c(Lat, Long))
+
+global <- global_cases %>%
+  full_join(global_deaths) %>%
+  rename(Country_Region = `Country/Region`,
+         Province_State = `Province/State`) %>%
+  mutate(date = mdy(date))
+
+global <- global %>% filter(cases>0)
+
+head(US_cases)
+
+US_cases <- US_cases %>%
+  pivot_longer(cols = -(UID:Combined_Key),
+               names_to = "date",
+               values_to = "cases") %>%
+  select(Admin2:cases) %>%
+  mutate(date = mdy(date)) %>%
+  select(-c(Lat, Long_))
+
+US_deaths <- US_deaths %>%
+  pivot_longer(cols = -(UID:Population),
+               names_to = "date",
+               values_to = "deaths") %>%
+  select(Admin2:deaths) %>%
+  mutate(date = mdy(date)) %>%
+  select(-c(Lat, Long_))
+
+US <- US_cases %>%
+  full_join(US_deaths)
+
+head(US)
+
+global <- global %>%
+  unite("Combined_Key",
+        c(Province_State, Country_Region),
+        sep = ", ",
+        na.rm = TRUE,
+        remove = FALSE)
+
+uid_lookup_url <- "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/UID_ISO_FIPS_LookUp_Table.csv"
+
+uid <- read_csv(uid_lookup_url) %>%
+  select(-c(Lat, Long_, Combined_Key, code3, iso2, iso3, Admin2))
+
+global <- global %>%
+  left_join(uid, by = c("Province_State", "Country_Region")) %>%
+  select(-c(UID,FIPS)) %>%
+  select(Province_State, Country_Region, date, cases, deaths, Population, Combined_Key) 
+
+head(global)
+
+US_by_state <- US %>%
+  group_by(Province_State, Country_Region, date) %>%
+  summarize(cases = sum(cases), deaths = sum(deaths),
+            Population = sum(Population)) %>%
+  mutate(deaths_per_mill = deaths * 1000000 / Population) %>%
+  mutate(cases_per_mill = cases * 1000000 / Population) %>%
+  select(Province_State, Country_Region, date,
+         cases, cases_per_mill, deaths, deaths_per_mill, Population) %>%
+  filter(cases > 0, Population > 0) %>%
+  ungroup()
+
+head(US_by_state)
+
+US_totals <- US_by_state %>%
+  group_by(Country_Region, date) %>%
+  summarize(cases = sum(cases), deaths = sum(deaths),
+            Population = sum(Population)) %>%
+  mutate(deaths_per_mill = deaths * 1000000 / Population) %>%
+  select(Country_Region, date,
+         cases, deaths, deaths_per_mill, Population) %>%
+  ungroup()
+
+US_state_totals <- US_by_state %>%
+  group_by(Province_State) %>%
+  summarize(deaths = max(deaths), cases = max(cases),
+            Population = max(Population),
+            cases_per_thous = 1000 * cases / Population,
+            deaths_per_thou = 1000 * deaths / Population) %>%
+  filter(cases > 0, Population > 0)
+
+head(US_state_totals)
+
+# Possible Bias: There are a few ways bias can be present in this data when looking at the case/death total by state. States that had fewer infections could have shown that due to an underreporting bias. It would be ideal if there was data available on number of tests taken, and normalize the cases_per_thous based on that. 
+```
+##Data Visualization 
+
+```{r visualize_data}
+US_by_state %>%
+  filter(Province_State %in% c("New York", "California", "Texas", "Florida")) %>%
+  ggplot(aes(x = date, y = cases_per_mill, color = Province_State)) +
+  geom_line(size = 1) +
+  labs(
+    title = "COVID-19 Case Growth (Per Million) in Major States",
+    x = "Date",
+    y = "Cases per Million People"
+  ) +
+  theme_minimal()
+
+# This shows waves and out of the most populated states, which ones had higher cases per million over time
+
+US_by_state %>%
+  filter(Province_State %in% c("New York", "California", "Texas", "Florida")) %>%
+  ggplot(aes(x = date, y = deaths_per_mill, color = Province_State)) +
+  geom_line() +
+  labs(title = "COVID-19 Deaths per Million Over Time", y = "Deaths per Million")
+
+# This shows which states had high deaths rates over different points of the pandemic. This can speak to New York's population density and extreme number of cases early on which lead to the over flooding of hospitals and lack of ventilators
+```
+## Modeling
+
+```{r modeling}
+US_by_state_model <- US_by_state %>%
+  filter(cases > 1000, Population > 0) %>%
+  mutate(
+    death_rate = deaths / cases,
+    log_cases = log(cases),
+    date_numeric = as.numeric(date),
+    days_since_start = date_numeric - min(date_numeric),  # standardized date
+    Province_State = as.factor(Province_State)
+  )
+
+model <- lm(death_rate ~ log_cases + days_since_start + Population + Province_State, data = US_by_state_model)
+
+summary(model)
+
+# This model shows a negative correlation with both number of cases and time since first outbreak with death rate. This makes sense as time goes on states have more time to adjust and understand needs of fighting a pandemic on the medical frontier. Looking at the data for states you can compare states vs the average state. For example California has a lower death rate then expected, vs Mississippi which has a higher death rate than expected. This could be due to the differences in how seriously states handled social distancing and medical treatment. 
+```
